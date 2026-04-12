@@ -1,0 +1,52 @@
+{
+  "features": [
+    "die_matrix",
+    "lifetime_2nd_strike_s",
+    "oee_cycle_time_s"
+  ],
+  "target": "lifetime_bath_s",
+  "oee_median": 13.8,
+  "valid_matrices": [
+    4974,
+    5052,
+    5090,
+    5091
+  ],
+  "training_rows": 134143,
+  "test_rows": 33536,
+  "hyperparameters": {
+    "n_estimators": 200,
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42
+  },
+  "metrics": {
+    "rmse": 1.8716,
+    "mae": 0.9407,
+    "r2": 0.6706
+  },
+  "per_matrix_metrics": {
+    "4974": {
+      "rmse": 0.903,
+      "mae": 0.467,
+      "r2": 0.7392
+    },
+    "5052": {
+      "rmse": 1.517,
+      "mae": 0.762,
+      "r2": 0.6864
+    },
+    "5090": {
+      "rmse": 2.077,
+      "mae": 1.126,
+      "r2": 0.6249
+    },
+    "5091": {
+      "rmse": 1.874,
+      "mae": 0.859,
+      "r2": 0.6742
+    }
+  }
+}
