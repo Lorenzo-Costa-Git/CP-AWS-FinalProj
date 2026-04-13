@@ -4,11 +4,18 @@ Forging Line — Piece Travel Time Dashboard
 Displays processed pieces with predicted bath time and per-stage
 timing detail.
 
-Usage:
+Usage (local model):
+    uv run streamlit run app/streamlit_app.py
+
+Usage (SageMaker endpoint):
+    SAGEMAKER_ENDPOINT_NAME=vaultech-bath-predictor \
+    AWS_DEFAULT_REGION=eu-west-1 \
     uv run streamlit run app/streamlit_app.py
 """
 
+import os
 import sys
+import time
 from pathlib import Path
 
 import altair as alt
@@ -18,9 +25,12 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from vaultech_analysis.inference import Predictor
+from vaultech_analysis.inference import Predictor, SageMakerPredictor
 
 GOLD_FILE = PROJECT_ROOT / "data" / "gold" / "pieces.parquet"
+
+SAGEMAKER_ENDPOINT = os.environ.get("SAGEMAKER_ENDPOINT_NAME", "")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
 
 PARTIAL_COLS = [
     "partial_furnace_to_2nd_strike_s",
@@ -53,7 +63,9 @@ CUMULATIVE_LABELS = [
 
 
 @st.cache_resource
-def load_predictor() -> Predictor:
+def load_predictor():
+    if SAGEMAKER_ENDPOINT:
+        return SageMakerPredictor(endpoint_name=SAGEMAKER_ENDPOINT, region=AWS_REGION)
     return Predictor(
         model_dir=PROJECT_ROOT / "models",
         gold_file=GOLD_FILE,
@@ -79,6 +91,11 @@ def get_reference() -> pd.DataFrame:
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Forging Line Dashboard", layout="wide")
 st.title("Forging Line — Piece Travel Time Dashboard")
+
+if SAGEMAKER_ENDPOINT:
+    st.caption(f"Inference: SageMaker endpoint `{SAGEMAKER_ENDPOINT}` ({AWS_REGION})")
+else:
+    st.caption("Inference: local XGBoost model")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 with st.spinner("Loading data and running predictions…"):
@@ -152,12 +169,36 @@ event = st.dataframe(
 selected_rows = event.selection.get("rows", []) if event.selection else []
 
 if selected_rows:
-    idx = filtered.reset_index(drop=True).index[selected_rows[0]]
     piece = filtered.reset_index(drop=True).iloc[selected_rows[0]]
     matrix = int(piece["die_matrix"])
     matrix_ref = ref.loc[matrix] if matrix in ref.index else None
 
     st.subheader(f"Piece detail — {piece['piece_id']}  |  Matrix {matrix}  |  {piece['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── Inference debug panel ─────────────────────────────────────────────────
+    if SAGEMAKER_ENDPOINT:
+        st.markdown("#### Inference debug — SageMaker endpoint call")
+        predictor = load_predictor()
+        t0 = time.time()
+        result = predictor.predict(
+            die_matrix=matrix,
+            lifetime_2nd_strike_s=float(piece["lifetime_2nd_strike_s"]),
+            oee_cycle_time_s=float(piece["oee_cycle_time_s"]) if pd.notna(piece["oee_cycle_time_s"]) else None,
+        )
+        debug = result.get("_debug", {})
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Endpoint", debug.get("endpoint", SAGEMAKER_ENDPOINT))
+        d2.metric("Predicted bath time", f"{result.get('predicted_bath_time_s', '—')}s")
+        d3.metric("Round-trip latency", f"{debug.get('latency_ms', '—')} ms")
+
+        col_pay, col_resp = st.columns(2)
+        with col_pay:
+            st.markdown("**Input payload (CSV)**")
+            st.code(debug.get("payload", ""), language="text")
+        with col_resp:
+            st.markdown("**Raw endpoint response**")
+            st.code(debug.get("raw_response", ""), language="text")
 
     # ── Cumulative times vs reference ─────────────────────────────────────────
     st.markdown("#### Cumulative travel times vs matrix reference")

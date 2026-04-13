@@ -3,10 +3,12 @@ Minimal SageMaker-compatible serving script for the XGBoost bath-time predictor.
 
 SageMaker protocol:
   GET  /ping         → 200 (health check)
-  POST /invocations  → prediction as plain text
+  POST /invocations  → prediction(s) as plain text
 
-Input format (text/csv): die_matrix,lifetime_2nd_strike_s,oee_cycle_time_s
-Output format: predicted_bath_s as a plain float string
+Input format (text/csv):
+  Single row:  die_matrix,lifetime_2nd_strike_s,oee_cycle_time_s
+  Multi-row:   one row per line (batch mode)
+Output: one float per input line, newline-separated.
 """
 
 import os
@@ -17,7 +19,6 @@ from flask import Flask, Response, request
 app = Flask(__name__)
 _model: xgb.Booster | None = None
 
-# Must match the feature order used during training
 FEATURE_NAMES = ["die_matrix", "lifetime_2nd_strike_s", "oee_cycle_time_s"]
 
 
@@ -43,14 +44,14 @@ def ping() -> Response:
 @app.route("/invocations", methods=["POST"])
 def invoke() -> Response:
     try:
-        raw = request.data.decode("utf-8").strip()
-        # Expect CSV: die_matrix,lifetime_2nd_strike_s,oee_cycle_time_s
-        values = [float(x) for x in raw.split(",")]
-        dm = xgb.DMatrix([values], feature_names=FEATURE_NAMES)
-        prediction = float(_load_model().predict(dm)[0])
-        return Response(
-            response=f"{prediction}\n", status=200, mimetype="text/csv"
-        )
+        raw = request.get_data(as_text=True).strip()
+        model = _load_model()
+        rows = [line.strip() for line in raw.splitlines() if line.strip()]
+        all_values = [[float(x) for x in row.split(",")] for row in rows]
+        dm = xgb.DMatrix(all_values, feature_names=FEATURE_NAMES)
+        preds = model.predict(dm)
+        result = "\n".join(str(float(p)) for p in preds)
+        return Response(response=result + "\n", status=200, mimetype="text/csv")
     except Exception as exc:
         return Response(response=str(exc), status=400, mimetype="text/plain")
 

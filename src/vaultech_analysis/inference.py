@@ -14,14 +14,26 @@ Usage as module (for Streamlit):
 
 import argparse
 import json
+import time
 from pathlib import Path
 
+import boto3
 import pandas as pd
 from xgboost import XGBRegressor
 
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 GOLD_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "gold" / "pieces.parquet"
+METADATA_FILE = MODEL_DIR / "model_metadata.json"
+
+# Fallback values matching the trained model — used by SageMakerPredictor
+# when the container runs without the models/ directory.
+_DEFAULT_METADATA = {
+    "features":        ["die_matrix", "lifetime_2nd_strike_s", "oee_cycle_time_s"],
+    "valid_matrices":  [4974, 5052, 5090, 5091],
+    "oee_median":      13.8,
+    "metrics":         {"rmse": 1.8716, "mae": 0.9407, "r2": 0.6706},
+}
 
 
 class Predictor:
@@ -86,6 +98,111 @@ class Predictor:
         X["oee_cycle_time_s"] = X["oee_cycle_time_s"].fillna(self._oee_median)
         predictions = self._model.predict(X)
         return pd.Series(predictions, index=df.index)
+
+
+class SageMakerPredictor:
+    """Calls the deployed SageMaker endpoint for inference.
+
+    Replaces the local Predictor when SAGEMAKER_ENDPOINT_NAME is set.
+    Identical public interface: predict() and predict_batch().
+    """
+
+    _BATCH_SIZE = 2000  # rows per invoke_endpoint call
+    _WORKERS = 20      # parallel batch workers
+
+    def __init__(self, endpoint_name: str, region: str = "eu-west-1"):
+        self._endpoint_name = endpoint_name
+        self._region = region
+        self._runtime = boto3.client("sagemaker-runtime", region_name=region)
+
+        # Load metadata from disk when available; fall back to known training
+        # values so the container works without the models/ directory.
+        if METADATA_FILE.exists():
+            with open(METADATA_FILE) as f:
+                meta = json.load(f)
+        else:
+            meta = _DEFAULT_METADATA
+
+        self._features = meta["features"]
+        self._metrics = meta["metrics"]
+        self._oee_median = meta.get("oee_median", 13.8)
+        self._valid_matrices = set(meta["valid_matrices"])
+
+    def predict(
+        self,
+        die_matrix: int,
+        lifetime_2nd_strike_s: float,
+        oee_cycle_time_s: float | None = None,
+    ) -> dict:
+        """Predict bath time via SageMaker endpoint.
+
+        Returns the same dict as Predictor.predict(), plus a '_debug' key
+        with payload, raw response, and round-trip latency.
+        """
+        if int(die_matrix) not in self._valid_matrices:
+            return {"error": f"Unknown die_matrix {die_matrix}. Valid: {sorted(self._valid_matrices)}"}
+
+        oee = oee_cycle_time_s if oee_cycle_time_s is not None else self._oee_median
+        payload = f"{int(die_matrix)},{float(lifetime_2nd_strike_s)},{float(oee)}"
+
+        t0 = time.time()
+        response = self._runtime.invoke_endpoint(
+            EndpointName=self._endpoint_name,
+            ContentType="text/csv",
+            Body=payload,
+        )
+        latency_ms = round((time.time() - t0) * 1000, 1)
+        raw = response["Body"].read().decode("utf-8").strip()
+        prediction = float(raw.split("\n")[0])
+
+        return {
+            "predicted_bath_time_s": round(prediction, 3),
+            "die_matrix":            int(die_matrix),
+            "lifetime_2nd_strike_s": float(lifetime_2nd_strike_s),
+            "oee_cycle_time_s":      oee_cycle_time_s,
+            "model_metrics":         self._metrics,
+            "_debug": {
+                "endpoint":     self._endpoint_name,
+                "payload":      payload,
+                "raw_response": raw,
+                "latency_ms":   latency_ms,
+            },
+        }
+
+    def predict_batch(self, df: pd.DataFrame) -> pd.Series:
+        """Predict bath time for a DataFrame using parallel large-batch requests.
+
+        Sends 2000 rows per HTTP call to the SageMaker endpoint, with 20
+        parallel workers — 169k rows completes in a few seconds.
+        """
+        import concurrent.futures
+        import boto3 as _boto3
+
+        X = df[self._features].copy()
+        X["oee_cycle_time_s"] = X["oee_cycle_time_s"].fillna(self._oee_median)
+
+        rows = [
+            f"{int(r['die_matrix'])},{float(r['lifetime_2nd_strike_s'])},{float(r['oee_cycle_time_s'])}"
+            for _, r in X.iterrows()
+        ]
+        chunks = [rows[i : i + self._BATCH_SIZE] for i in range(0, len(rows), self._BATCH_SIZE)]
+
+        def _call_chunk(chunk: list[str]) -> list[float]:
+            rt = _boto3.client("sagemaker-runtime", region_name=self._region)
+            payload = "\n".join(chunk).encode("utf-8")
+            resp = rt.invoke_endpoint(
+                EndpointName=self._endpoint_name,
+                ContentType="text/csv",
+                Body=payload,
+            )
+            raw = resp["Body"].read().decode("utf-8").strip()
+            return [float(v) for v in raw.splitlines() if v.strip()]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._WORKERS) as pool:
+            results = list(pool.map(_call_chunk, chunks))
+
+        preds = [p for chunk_preds in results for p in chunk_preds]
+        return pd.Series(preds, index=df.index)
 
 
 def main():
