@@ -54,5 +54,5 @@ def post_diagnose(piece: PieceRequest) -> dict:
     try:
         return diagnose(piece.model_dump())
     except ValueError as exc:
-        # Unknown die_matrix → HTTP 400 per §2.1 error handling
-        raise HTTPException(status_code=400, detail={"error": str(exc)})
+        # Unknown die_matrix → HTTP 400 per §2.1, exact format: {"error": "unknown die_matrix <value>"}
+        return JSONResponse(status_code=400, content={"error": str(exc)})
